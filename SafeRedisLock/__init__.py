@@ -4,43 +4,35 @@
     All Rights Reserved, Licensed under LGPL version 3.0
 
     See LICENSE with distribution for details.
+
+
+    Implements a "Safe" queued shared lock that uses Redis, and can be accessed from multiple servers, processes, whatever.
+
+    See class and method docstrings for more info.
 '''
 
+# vim: set ts=4 sw=4 st=4 expandtab :
+
 import redis
+import socket
 import time
 import uuid
-import socket
-import sys
 
-DEFAULT_POLL_INTERVAL = .02
+from .compat import strify
+
+# DEFAULT_POLL_INTERVAL - The default poll interval for acquiring locks (overridable by pollInterval on __init__)
+DEFAULT_POLL_INTERVAL = .1
+# DEFAULT_GLOBAL_TIMEOUT - The default global timeout for locks. If an acquired lock is not refreshed within
+#  this period, it is automatically released.
 DEFAULT_GLOBAL_TIMEOUT = 30.0
 
 __version__ = '1.0.0'
 __version_tuple__ = (1, 0, 0)
 
-__all__ = ('DEFAULT_POLL_INTERVAL', 'SafeRedisLock')
+__all__ = ('DEFAULT_POLL_INTERVAL', 'SafeRedisLock', 'createSafeRedisLockType')
 
 # Calculate this ONCE so that if the hostname changes it doesn't screw with the lock
 MY_HOSTNAME = socket.gethostname()
-
-# In python 3, redis returns "bytes", so convert to str in that case.
-if sys.version_info.major >= 3:
-    def strify(x):
-        # If we have "bytes", turn it into a string.
-        if isinstance(x, bytes):
-            return x.decode('utf-8')
-        # If we have a list (like from lrange), convert each item to a string.
-        elif isinstance(x, (tuple, list)):
-            ret = [strify(item) for item in x]
-            if isinstance(ret, tuple):
-                ret = tuple(ret)
-            return ret
-        # Otherwise, return what we got.
-        return x
-else:
-    # Python 2 we already have what we want
-    strify = lambda x : x
-
 
 def createSafeRedisLockType(key, globalTimeout=DEFAULT_GLOBAL_TIMEOUT, pollInterval=DEFAULT_POLL_INTERVAL, redisConnectionParams=None):
     '''
@@ -89,13 +81,14 @@ class SafeRedisLock(object):
 
         *Properties of interest*:
 
-            acquiredAt <float/None> - This property reflects the timestamp wherein we acquired the lock, or "None" if we have never acquired a lock on this object. If we release the lock, or we are automatically expired, or some client calls "clear", this value will remain the timestamp of the LAST lock held.
+            acquiredAt <float/None> - This property reflects the timestamp wherein we acquired the lock, or "None" if we have never acquired a lock on this object. This value is not reset to "None" when the lock is lost/released. @see #lockTimestamp
 
-            lockTimestamp <float/None> - This property reflects the current timestamp on this lock. This differs from #acquiredAt in that calling "acquire" whilst holding the lock will refresh the lock's timestamp, and this value will be updated. If we release the lock, or we are automatically expired, or some client calls "clear", this value will remain the timestamp of the LAST lock held.
+            lockTimestamp <float/None> - This property reflects the current timestamp on this lock. This differs from #acquiredAt in that calling "acquire" whilst holding the lock will refresh the lock's timestamp, and this value will be updated. This value is not reset to "None" when the lock is lost/released.
 
-            hasLock    <bool> - Perform a query of the Redis server to determine if we still hold the lock
+            hasLock    <bool> - Perform a query of the Redis server to determine if we currently hold the lock
 
-            secondsRemaining <float/None> - The number of seconds remaining before this lock is automatically expired. If we have never acquired a lock, this will be "None". This number could be negative if we have passed the global timeout since expiring.
+            secondsRemaining <float/None> - The number of seconds remaining before this lock is automatically expired. If we have never acquired a lock, this will be "None". This number could be negative if we have passed the global timeout since expiring. This value is not reset to "None" when the lock is lost/released.
+
 
         *Methods of interest*:
 
@@ -124,21 +117,31 @@ class SafeRedisLock(object):
                 Generally, the keys you may use are "host" [hostname of Redis server], "port" [port on which to connect], and "db" [A number representing the Redis namespace in which to store the key]
 
 
+            NOTE: There is undefined (and probably undesirable) behaviour if #globalTimeout is different on multiple SafeRedisLock objects using the same #key.
+                If you will use the same lock in multiple places within your code, instead of instantiating the SafeRedisLock object directly,
+                you are strongly recommended to use the #createSafeRedisLockType method. @see createSafeRedisLockType
 
+                This will ensure that all locks that use the same key are defined the same way, and prevent mistakes like, updating the redis db used on 3/4 of the locks,
+                but forget about "applicationX", etc.
 
         '''
 
         # self.key - The key for this lock
         self.key = key
+
         # self.globalTimeout - Automatic expiration of locks after this much time
+        if globalTimeout < 0:
+            raise ValueError('Provided global timeout %f must be a positive number.' %(globalTimeout, ) )
         self.globalTimeout = globalTimeout
+
         # self.uuid
         self.uuid = self._genUuid()
 
-        if pollInterval <= 0:
-            raise ValueError('Provided poll interval %s must be > 0 seconds.' %(repr(pollInterval), ))
         # self.pollInterval - Minimum number of seconds between polling the Redis server waiting for lock (in acquire method)
+        if pollInterval <= 0:
+            raise ValueError('Provided poll interval %f must be > 0 seconds.' %(pollInterval,) )
         self.pollInterval = pollInterval
+
         # self.redisConnectionParams - Dict of paramaters to pass to redis.Redis when creating a connection.
         self.redisConnectionParams = redisConnectionParams or {}
 
@@ -163,21 +166,11 @@ class SafeRedisLock(object):
         conn = self._getConnection()
         key = self.key
 
-        if self.hasLock is True:
-            # Refresh the lock
-            now = time.time()
-            nextInLine = strify(conn.lrange(key, -1, -1))
-            if not nextInLine:
-                # Cleared.
-                return False
-            oldKey = nextInLine[0]
-            (ownerUuid, ownerTimestamp) = oldKey.split('__')
-            if ownerUuid != self.uuid:
-                # We got bumped.
-                return False
+        (hasLock, nextInLine) = self._hasLockPlusKey()
 
-            # We still hold the lock, so refresh it
-            self.__updateLockTimestamp(oldKey, conn)
+        if hasLock is True:
+            # Refresh the lock
+            self.__updateLockTimestamp(nextInLine, conn)
 
             return True
 
@@ -271,27 +264,24 @@ class SafeRedisLock(object):
 
             @return <bool> - True if we released it, False if we didn't actually have it.
         '''
-        if not self.hasLock:
-            return False
+        # Even if we expired or whatever, release anything matching this last key's acquisition
+        #  to prevent garbage in the queue, which would cause the next acquire() to go slower-path 
+        #  instead of fastpath.
+#        if not self.hasLock:
+#            return False
 
         conn = self._getConnection()
 
-        i = 0
         ret = False
         lineItems = strify(conn.lrange(self.key, 0, -1))
-        lineItems.reverse()
-        pipeline = conn.pipeline()
         for item in lineItems:
             if item.split('__')[0] == self.uuid:
-                pipeline.lrem(self.key, item)
-                if i == 0:
-                    # We had the lock
-                    ret = True
-        pipeline.execute()
+                conn.lrem(self.key, item)
+                # We removed something
+                ret = True
 
         self.lockTimestamp = None
 
-        # self.hasLock = False
         return ret
 
     @property
@@ -300,23 +290,7 @@ class SafeRedisLock(object):
             hasLock - Property. Checks Redis to see if we are currently holding the lock with this object.
                 This will query the server, so if you plan to call this often (like in a series of conditionals), consider calling once and assigning to a local variable.
         '''
-        conn = self._getConnection()
-
-        nextInLine = strify(conn.lrange(self.key, -1, -1))
-        if not nextInLine:
-            return False
-
-        nextInLine = nextInLine[0]
-        (ownerUuid, ownerTimestamp) = nextInLine.split('__')
-        if ownerUuid == self.uuid:
-            if not self.globalTimeout:
-                return True
-            if time.time() - float(ownerTimestamp) < self.globalTimeout:
-                return True
-            else:
-                return False
-        return False
-            
+        return self._hasLockPlusKey()[0]
 
     @property
     def secondsRemaining(self):
@@ -348,6 +322,8 @@ class SafeRedisLock(object):
 
         self.lockTimestamp = time.time()
         timestampedKey = "%s__%f" %(self.uuid, self.lockTimestamp)
+        # Insert the new key after the old key (which is actually in front of, since we are using a stack as a queue)
+        #  Then remove the old key. We do in a pipeline so this is one atomic transaction.
         pipeline = conn.pipeline()
         pipeline.linsert(self.key, 'AFTER', oldKey, timestampedKey)
         pipeline.lrem(self.key, oldKey)
@@ -357,11 +333,11 @@ class SafeRedisLock(object):
         '''
             _setGotLock - Set properties relating to acquiring a lock
         '''
-        #self.hasLock = True
         self.acquiredAt = time.time()
         self.lockTimestamp = self.acquiredAt
 
-    def _genUuid(self):
+    @staticmethod
+    def _genUuid():
         '''
             _genUuid - Generate the uuid for this instance's lock acquisition.
                 This will be called each time we enter the queue to acquire a lock.
@@ -373,11 +349,69 @@ class SafeRedisLock(object):
         # Double your random, double your fun...
         return "%s+%s%s" %(MY_HOSTNAME, str(uuid.uuid4()), str(uuid.uuid4()))
 
+#
+#
+#                            oooo$$$$$$$$$$$$oooo
+#                        oo$$$$$$$$$$$$$$$$$$$$$$$$o
+#                     oo$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$o         o$   $$ o$
+#     o $ oo        o$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$o       $$ $$ $$o$
+#  oo $ $ "$      o$$$$$$$$$    $$$$$$$$$$$$$    $$$$$$$$$o       $$$o$$o$
+#  "$$$$$$o$     o$$$$$$$$$      $$$$$$$$$$$      $$$$$$$$$$o    $$$$$$$$
+#    $$$$$$$    $$$$$$$$$$$      $$$$$$$$$$$      $$$$$$$$$$$$$$$$$$$$$$$
+#    $$$$$$$$$$$$$$$$$$$$$$$    $$$$$$$$$$$$$    $$$$$$$$$$$$$$  """$$$
+#     "$$$""""$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$     "$$$
+#      $$$   o$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$     "$$$o
+#     o$$"   $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$       $$$o
+#     $$$    $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$" "$$$$$$ooooo$$$$o
+#    o$$$oooo$$$$$  $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$   o$$$$$$$$$$$$$$$$$
+#    $$$$$$$$"$$$$   $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$     $$$$""""""""
+#   """"       $$$$    "$$$$$$$$$$$$$$$$$$$$$$$$$$$$"      o$$$
+#              "$$$o     """$$$$$$$$$$$$$$$$$$"$$"         $$$
+#                $$$o          "$$""$$$$$$""""           o$$$
+#                 $$$$o                                o$$$"
+#                  "$$$$o      o$$$$$$o"$$$$o        o$$$$
+#                    "$$$$$oo     ""$$$$o$$$$$o   o$$$$""
+#                       ""$$$$$oooo  "$$$o$$$$$$$$$"""
+#                          ""$$$$$$$oo $$$$$$$$$$
+#                                  """"$$$$$$$$$$$
+#                                      $$$$$$$$$$$$
+#                                       $$$$$$$$$$"
+#                                        "$$$""  
+#
+#
+#    Oh hello there......
+#      Would you like to play a game?
+#
+
     def _getConnection(self):
         '''
             _getConnection - Get a Redis connection based on the connection params provided in __init__
         '''
         return redis.Redis(**self.redisConnectionParams)
+
+    def _hasLockPlusKey(self):
+        '''
+            _hasLockPlusKey - Checks if this object currently holds the lock, and returns the key of the lock holder, whether or not it is this object.
+                This is used internally for optimization purposes, externally I can't see how this would be useful.
+
+            @return tuple( hasLock<bool>, frontOfLine<str/None> ) - Tuple, first arg is True/False if this object has the lock, second arg is the key (uuid+__+timestamp) of the lock owner.
+        '''
+        conn = self._getConnection()
+
+        nextInLine = strify(conn.lrange(self.key, -1, -1))
+        if not nextInLine:
+            return (False, None)
+
+        nextInLine = nextInLine[0]
+        (ownerUuid, ownerTimestamp) = nextInLine.split('__')
+        if ownerUuid == self.uuid:
+            if not self.globalTimeout:
+                return (True, nextInLine)
+            if time.time() - float(ownerTimestamp) < self.globalTimeout:
+                return (True, nextInLine)
+            else:
+                return (False, nextInLine)
+        return (False, nextInLine)
 
 
     @property
@@ -387,4 +421,6 @@ class SafeRedisLock(object):
         '''
         return strify(self._getConnection().lrange(self.key, 0, -1))
 
+
+# vim: set ts=4 sw=4 st=4 expandtab :
 
