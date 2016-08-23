@@ -198,6 +198,7 @@ class SafeRedisLock(object):
             keepGoing = lambda : True
 
         while keepGoing():
+            loopStartTime = time.time()
             nextInLine = strify(conn.lrange(key, -1, -1))
             if not nextInLine:
                 # Something happened, just incase remove ourself and repush
@@ -258,7 +259,8 @@ class SafeRedisLock(object):
                 conn.lrem(key, timestampedKey)
                 return False
 
-            time.sleep(pollInterval)
+            sleepTime = max(0.00001, pollInterval - (time.time() - loopStartTime))
+            time.sleep(sleepTime)
 
         conn.lrem(key, timestampedKey)
         return False
