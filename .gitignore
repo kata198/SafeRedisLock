@@ -3,3 +3,7 @@
 *.py[oc]
 myenv*
 *.sw[po]
+tests/
+dist/
+build/
+*.egg-info/
