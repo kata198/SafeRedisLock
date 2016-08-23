@@ -41,6 +41,46 @@ else:
     # Python 2 we already have what we want
     strify = lambda x : x
 
+
+def createSafeRedisLockType(key, globalTimeout=DEFAULT_GLOBAL_TIMEOUT, pollInterval=DEFAULT_POLL_INTERVAL, redisConnectionParams=None):
+    '''
+        createSafeRedisLockType - Creates a class which represents a SafeRedisLock fixed to a specific key and parameters.
+
+            Use this method to create a new type if you have multiple places in your code that will lock on the same key.
+            This ensures that they will all share the same __init__ properties, and you update your code in one place to affects locks against this key everywhere.
+
+            Using different values for parameters on the same key, especially "globalTimeout", will lead to undefined behaviour.
+
+        Example:
+
+            GlobalDataLock = SafeRedisLock.createSafeRedisLockType('GblDataLockType', globalTimeout=20, redisConnectionParams={'host' : 'hostX.mydomain'})
+
+            ....
+            def method1(self):
+                globalDataLock = GlobalDataLock()
+
+                globalDataLock.acquire()
+                ....
+
+            def method2(self):
+                globalDataLock = GlobalDataLock()
+
+                globalDataLock.acquire()
+                ...
+
+        @return <class> - A class that extends SafeRedisLock.SafeRedisLock, fixed to a specified key and specified variables. The __init__ method of this class has no parameters.
+
+        @see SafeRedisLock.__init__
+
+    '''
+
+    class _SafeRedisLockType(SafeRedisLock):
+        def __init__(self):
+            SafeRedisLock.__init__(self, key, globalTimeout, pollInterval, redisConnectionParams)
+
+    _SafeRedisLockType.__name__ = 'SafeRedisLock_' + key
+    return _SafeRedisLockType
+
 class SafeRedisLock(object):
     '''
         SafeRedisLock - An atomic shared lock implementation using Redis which is implemented as a queue (so multiple folks trying to acquire get the lock in-turn), and supports a global timeout (A set timer, which can be refreshed by a lock-holder, which marks the maximum time before the lock automatically expires). This timeout prevents a crashed process from holding the lock forever, or unsafe semantics to otherwise clear or manage against such an issue.
@@ -344,3 +384,5 @@ class SafeRedisLock(object):
             _sq - Debug method to view the queue. Note that this goes right-to-left.
         '''
         return strify(self._getConnection().lrange(self.key, 0, -1))
+
+
