@@ -68,7 +68,7 @@ class SafeRedisLock(object):
         @See __init__ method docstring for more information
 
     '''
-    def __init__(self, key, globalTimeout=DEFAULT_GLOBAL_TIMEOUT, pollInterval=DEFAULT_POLL_INTERVAL, redisConnectionParams={}):
+    def __init__(self, key, globalTimeout=DEFAULT_GLOBAL_TIMEOUT, pollInterval=DEFAULT_POLL_INTERVAL, redisConnectionParams=None):
         '''
             Create a SafeRedisLock.
 
@@ -80,7 +80,7 @@ class SafeRedisLock(object):
 
             @param pollInterval <float> - Minimum number of seconds between polling the Redis server for lock status. Defaults to DEFAULT_POLL_INTERVAL (0.02 seconds)
 
-            @param redisConnectionParams <dict> - Parameters required to establish a Redis connection (passed to redis.Redis.__init__). See help(redis.Redis.__init__) for details.
+            @param redisConnectionParams <dict/None> - Parameters required to establish a Redis connection (passed to redis.Redis.__init__). See help(redis.Redis.__init__) for details.
                 Generally, the keys you may use are "host" [hostname of Redis server], "port" [port on which to connect], and "db" [A number representing the Redis namespace in which to store the key]
 
 
@@ -100,7 +100,7 @@ class SafeRedisLock(object):
         # self.pollInterval - Minimum number of seconds between polling the Redis server waiting for lock (in acquire method)
         self.pollInterval = pollInterval
         # self.redisConnectionParams - Dict of paramaters to pass to redis.Redis when creating a connection.
-        self.redisConnectionParams = redisConnectionParams
+        self.redisConnectionParams = redisConnectionParams or {}
 
         # self.acquiredAt - A timestamp representing the last time we acquired the lock.
         self.acquiredAt = None
