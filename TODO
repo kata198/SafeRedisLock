@@ -1,0 +1,8 @@
+
+* Update documentation 
+* Add pydocs
+* Add setup.py and README.rst, etc
+* Unit tests
+
+
+If you have found this, the code is stable and tested and works. Feel free to use it before I officially release it.

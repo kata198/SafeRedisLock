@@ -58,3 +58,13 @@ SafeRedisLock Class
 
 			If a lock is currently sitting in acquire, it should put itself back in the queue. Use this method only if you know what you're doing...
 		'''
+
+TODO
+----
+* Update documentation (including this)
+* Add pydocs
+* Add setup.py and README.rst, etc
+* Unit tests
+
+
+If you have found this, the code is stable and tested and works. Feel free to use it before I officially release it.
