@@ -182,7 +182,7 @@ class SafeRedisLock(object):
 
         timestampedKey = "%s__%f" %(self.uuid, now)
 
-        conn.lpush(key, timestampedKey)
+        conn.rpush(key, timestampedKey)
 
 
         if blockingTimeout:
@@ -192,12 +192,12 @@ class SafeRedisLock(object):
 
         while keepGoing():
             loopStartTime = time.time()
-            nextInLine = strify(conn.lrange(key, -1, -1))
+            nextInLine = strify(conn.lrange(key, 0, 0))
             if not nextInLine:
                 # Something happened, just incase remove ourself and repush
                 conn.lrem(key, timestampedKey)
-                conn.lpush(key, timestampedKey)
-                nextInLine = strify(conn.lrange(key, -1, -1))
+                conn.rpush(key, timestampedKey)
+                nextInLine = strify(conn.lrange(key, 0, 0))
                 if not nextInLine:
                     try:
                         conn.lrem(key, timestampedKey)
@@ -221,10 +221,9 @@ class SafeRedisLock(object):
                 if now - ownerTimestamp > self.globalTimeout:
                     # The next key in line is past the global key timeout
                     allKeys = strify(conn.lrange(key, 0, -1))
-                    allKeys.reverse()
                     if timestampedKey not in allKeys:
                         # Something happened and key got cleared, put us back in.
-                        conn.lpush(key, timestampedKey)
+                        conn.rpush(key, timestampedKey)
                         continue
 
 
@@ -322,10 +321,10 @@ class SafeRedisLock(object):
 
         self.lockTimestamp = time.time()
         timestampedKey = "%s__%f" %(self.uuid, self.lockTimestamp)
-        # Insert the new key after the old key (which is actually in front of, since we are using a stack as a queue)
-        #  Then remove the old key. We do in a pipeline so this is one atomic transaction.
+        # Insert the new key before the old key, and then remove the old key.
+        #  We do in a pipeline so this is one atomic transaction.
         pipeline = conn.pipeline()
-        pipeline.linsert(self.key, 'AFTER', oldKey, timestampedKey)
+        pipeline.linsert(self.key, 'BEFORE', oldKey, timestampedKey)
         pipeline.lrem(self.key, oldKey)
         pipeline.execute()
 
@@ -398,7 +397,7 @@ class SafeRedisLock(object):
         '''
         conn = self._getConnection()
 
-        nextInLine = strify(conn.lrange(self.key, -1, -1))
+        nextInLine = strify(conn.lrange(self.key, 0, 0))
         if not nextInLine:
             return (False, None)
 
@@ -417,7 +416,7 @@ class SafeRedisLock(object):
     @property
     def _sq(self):
         '''
-            _sq - Debug method to view the queue. Note that this goes right-to-left.
+            _sq - Debug method to view the queue. 
         '''
         return strify(self._getConnection().lrange(self.key, 0, -1))
 
